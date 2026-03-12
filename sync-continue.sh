@@ -16,7 +16,7 @@
 
 set -euo pipefail
 
-CONTINUE_DIR="$HOME/repos/continue-dev"
+CONTINUE_DIR="$HOME/repos/continue_dev"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 cd "$CONTINUE_DIR"

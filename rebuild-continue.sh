@@ -4,7 +4,7 @@
 
 set -e
 
-CONTINUE_DIR="$HOME/repos/continue-dev"
+CONTINUE_DIR="$HOME/repos/continue_dev"
 VSCODE_EXT_DIR="$CONTINUE_DIR/extensions/vscode"
 
 echo "Building Continue.dev from source..."

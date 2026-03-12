@@ -1,0 +1,137 @@
+# Super Coder — Unified LLM Proxy
+# Five model sources routed through localhost:8000
+#
+# 1. Copilot - Claude Opus   (GitHub Copilot CLI + claude-opus-4.6)
+# 2. Claude Pro - Smart      (Claude Code CLI, auto model selection)
+# 3. Super Coder             (Local Ollama — free, offline)
+# 4. Gemini Web              (Browser cookies — generous quota, no API key)
+# 5. Gemini API              (Google AI Studio — free tier, requires GOOGLE_API_KEY)
+
+aliases:
+  # ── Continue Pro (smart router: auto-selects Claude Pro vs Copilot) ──
+  continue-pro:
+    backend: smart_router
+    model: continue-pro
+
+  # ── 1. Copilot - Claude Opus (via GitHub Copilot CLI) ──
+  copilot-opus:
+    backend: copilot_opus
+    model: copilot-opus
+
+  # ── 1b. Copilot - GPT 5.3 Codex (current flagship) ──
+  copilot-gpt:
+    backend: copilot_gpt
+    model: copilot-gpt
+
+  # ── 1c. Copilot - GPT-5 Mini ──
+  copilot-gpt-mini:
+    backend: copilot_gpt_mini
+    model: copilot-gpt-mini
+
+  # ── 1d. Copilot - Raptor Mini (gpt-5.1-codex-mini) ──
+  copilot-raptor-mini:
+    backend: copilot_raptor_mini
+    model: copilot-raptor-mini
+
+  # ── 2. Claude Pro - Smart (via Claude Code CLI) ──
+  claude-smart:
+    backend: claude_smart
+    model: claude-smart
+
+  # ── 3. Super Coder (local Ollama hybrid) ──
+  super-coder:
+    backend: ollama
+    model: qwen3-coder
+
+  super-coder-fast:
+    backend: ollama
+    model: qwen2.5-coder
+
+  super-coder-lite:
+    backend: ollama
+    model: codellama:7b
+
+  # ── 4. Gemini Web (browser session — generous quota, no API key needed) ──
+  gemini-flash-web:
+    backend: gemini_web
+    model: gemini-3.0-flash
+
+  gemini-pro-web:
+    backend: gemini_web
+    model: gemini-3.1-pro
+
+  gemini-thinking-web:
+    backend: gemini_web
+    model: gemini-3.0-flash-thinking
+
+  # ── 5. Gemini API (Google AI Studio — free tier, requires GOOGLE_API_KEY) ──
+  gemini-flash-api:
+    backend: gemini_api
+    model: gemini-2.0-flash
+
+  gemini-pro-api:
+    backend: gemini_api
+    model: gemini-2.5-pro-preview-05-06
+
+backends:
+  # Smart router — analyzes complexity, routes to Claude Pro or Copilot
+  smart_router:
+    type: smart_router
+
+  ollama:
+    type: openai_compatible
+    base_url: http://localhost:11434/v1
+    api_key: ollama
+
+  # Claude Code CLI — smart mode (no --model = auto-selects best available)
+  claude_smart:
+    type: cli
+    cli_binary: claude
+
+  # GitHub Copilot CLI — Claude Opus 4.6
+  # --allow-all is required for non-interactive (-p) mode
+  copilot_opus:
+    type: cli
+    cli_binary: copilot
+    cli_args: ["--model", "claude-opus-4.6", "-s", "--allow-all"]
+
+  # GitHub Copilot CLI — GPT 5.3 Codex (current flagship)
+  copilot_gpt:
+    type: cli
+    cli_binary: copilot
+    cli_args: ["--model", "gpt-5.3-codex", "-s", "--allow-all"]
+
+  # GitHub Copilot CLI — GPT-5 Mini
+  copilot_gpt_mini:
+    type: cli
+    cli_binary: copilot
+    cli_args: ["--model", "gpt-5-mini", "-s", "--allow-all"]
+
+  # GitHub Copilot CLI — Raptor Mini (gpt-5.1-codex-mini)
+  copilot_raptor_mini:
+    type: cli
+    cli_binary: copilot
+    cli_args: ["--model", "gpt-5.1-codex-mini", "-s", "--allow-all"]
+
+  # Gemini Web — auto-extracts cookies from Chrome, OR paste explicitly below.
+  # Explicit cookies are more reliable (bypass macOS Keychain prompts):
+  #   1. Open Chrome → gemini.google.com → sign in
+  #   2. F12 → Application → Cookies → https://gemini.google.com
+  #   3. Copy __Secure-1PSID and __Secure-1PSIDTS values below
+  gemini_web:
+    type: gemini_web
+    cookies:
+      __Secure-1PSID: ""      # paste value here (or leave empty for auto-extract)
+      __Secure-1PSIDTS: ""    # paste value here (or leave empty for auto-extract)
+
+  # Gemini API — set GOOGLE_API_KEY env var to enable:
+  #   export GOOGLE_API_KEY="AIza..."
+  #   Get a free key at: https://aistudio.google.com/app/apikey
+  gemini_api:
+    type: gemini
+    api_key_env: GOOGLE_API_KEY
+
+server:
+  host: 127.0.0.1
+  port: 8000
+  log_level: info

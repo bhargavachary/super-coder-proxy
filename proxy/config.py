@@ -77,8 +77,9 @@ class ProxyConfig:
 
         # 3. Heuristic routing for the three Super Coder sources
         if model in ("claude", "claude-cli", "claude-pro"):
-            if "claude_cli" in self.backends:
-                return self.backends["claude_cli"], model
+            for bname in ("claude_cli", "claude_smart"):
+                if bname in self.backends:
+                    return self.backends[bname], model
         if model in ("copilot", "copilot-cli"):
             if "copilot_cli" in self.backends:
                 return self.backends["copilot_cli"], model

@@ -8,11 +8,6 @@
 # 5. Gemini API              (Google AI Studio — free tier, requires GOOGLE_API_KEY)
 
 aliases:
-  # ── Continue Pro (smart router: auto-selects Claude Pro vs Copilot) ──
-  continue-pro:
-    backend: smart_router
-    model: continue-pro
-
   # ── 1. Copilot - Claude Opus (via GitHub Copilot CLI) ──
   copilot-opus:
     backend: copilot_opus
@@ -74,10 +69,6 @@ aliases:
     model: gemini-2.5-pro-preview-05-06
 
 backends:
-  # Smart router — analyzes complexity, routes to Claude Pro or Copilot
-  smart_router:
-    type: smart_router
-
   ollama:
     type: openai_compatible
     base_url: http://localhost:11434/v1

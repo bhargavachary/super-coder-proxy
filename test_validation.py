@@ -39,14 +39,14 @@ def pass_1():
     try:
         c = load_config()
         assert isinstance(c, ProxyConfig), "Config is not ProxyConfig"
-        assert len(c.backends) == 9, f"Expected 9 backends, got {len(c.backends)}"
-        assert len(c.aliases) == 14, f"Expected 14 aliases, got {len(c.aliases)}"
+        assert len(c.backends) == 8, f"Expected 8 backends, got {len(c.backends)}"
+        assert len(c.aliases) == 13, f"Expected 13 aliases, got {len(c.aliases)}"
         assert c.host == "127.0.0.1", f"Unexpected host: {c.host}"
         assert c.port == 8000, f"Unexpected port: {c.port}"
 
         # Check all expected backends exist
         expected_backends = [
-            "smart_router", "ollama", "claude_smart",
+            "ollama", "claude_smart",
             "copilot_opus", "copilot_gpt", "copilot_gpt_mini",
             "copilot_raptor_mini", "gemini_web", "gemini_api",
         ]
@@ -62,7 +62,7 @@ def pass_1():
 
         # Check all aliases exist
         expected_aliases = [
-            "continue-pro", "copilot-opus", "copilot-gpt",
+            "copilot-opus", "copilot-gpt",
             "copilot-gpt-mini", "copilot-raptor-mini", "claude-smart",
             "super-coder", "super-coder-fast", "super-coder-lite",
             "gemini-flash-web", "gemini-pro-web", "gemini-thinking-web",
@@ -71,7 +71,7 @@ def pass_1():
         for a in expected_aliases:
             assert a in c.aliases, f"Missing alias: {a}"
 
-        record(1, "Config Integrity", True, "9 backends, 14 aliases, all present")
+        record(1, "Config Integrity", True, "8 backends, 13 aliases, all present")
     except Exception as e:
         record(1, "Config Integrity", False, str(e))
 
@@ -87,7 +87,6 @@ def pass_2():
     all_ok = True
     tests = [
         # (input, expected_backend, expected_model)
-        ("continue-pro", "smart_router", "continue-pro"),
         ("copilot-opus", "copilot_opus", "copilot-opus"),
         ("claude-smart", "claude_smart", "claude-smart"),
         ("super-coder", "ollama", "qwen3-coder"),
@@ -117,7 +116,7 @@ def pass_2():
             print(f"  [OK]   {alias} -> {backend.name}/{model}")
 
     record(2, "Alias Resolution", all_ok,
-           f"14 tests, {'all passed' if all_ok else 'SOME FAILED'}")
+           f"13 tests, {'all passed' if all_ok else 'SOME FAILED'}")
 
 
 # ═══════════════════════════════════════════════════════════════

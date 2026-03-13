@@ -65,7 +65,6 @@ gemini-pro-web        # Gemini Web → 3.1 Pro
 gemini-thinking-web   # Gemini Web → Flash Thinking
 gemini-flash-api      # Gemini API → 2.0 Flash
 gemini-pro-api        # Gemini API → 2.5 Pro
-continue-pro          # Smart Router (auto Claude/Copilot)
 ```
 
 ## Continue.dev Integration

@@ -2,8 +2,8 @@
 
 Exposes /v1/chat/completions and routes to:
   1. Local Ollama models
-  2. Claude Pro CLI
-  3. GitHub Copilot Pro CLI
+  2. Claude CLI
+  3. GitHub Copilot CLI
   4. Gemini Web (browser cookies)
   5. Gemini API (Google AI Studio)
 """
@@ -82,8 +82,6 @@ async def chat_completions(request: Request):
         model_requested, backend.name, actual_model, stream,
     )
 
-    if backend.type == "smart_router":
-        return await _handle_smart_router(body, stream)
     if backend.type == "anthropic":
         return await _handle_anthropic(backend, body, stream)
     if backend.type == "cli":
@@ -92,57 +90,6 @@ async def chat_completions(request: Request):
         return await _handle_gemini_web(backend, body, stream)
     if backend.type == "gemini":
         return await _handle_gemini(backend, body, stream)
-    return await _handle_openai_compatible(backend, body, stream)
-
-
-def _estimate_complexity(messages: list[dict]) -> str:
-    """Estimate prompt complexity to route between Claude Pro and Copilot.
-
-    Returns "high" for complex tasks (-> Claude Pro) or "low" for simple ones (-> Copilot).
-    """
-    full_text = " ".join(m.get("content", "") for m in messages).lower()
-    char_count = len(full_text)
-    msg_count = len(messages)
-
-    # High complexity indicators
-    high_signals = [
-        char_count > 3000,
-        msg_count > 6,
-        any(kw in full_text for kw in [
-            "refactor", "architect", "design", "complex", "optimize",
-            "security", "vulnerability", "debug", "trace", "analyze",
-            "multi-file", "codebase", "migration", "performance",
-            "concurrency", "async", "distributed", "system design",
-        ]),
-    ]
-
-    return "high" if sum(high_signals) >= 1 else "low"
-
-
-async def _handle_smart_router(body: dict, stream: bool):
-    """Continue Pro: smart routing between Claude Pro CLI and Copilot CLI.
-
-    Routes complex/long prompts to Claude Pro (smarter, deeper reasoning).
-    Routes simple/short prompts to Copilot (faster, free tier friendly).
-    """
-    messages = body.get("messages", [])
-    complexity = _estimate_complexity(messages)
-
-    if complexity == "high":
-        target_alias = "claude-smart"
-    else:
-        target_alias = "copilot-opus"
-
-    backend, actual_model = config.resolve_model(target_alias)
-    body["model"] = actual_model
-
-    logger.info(
-        "Smart router: complexity=%s -> %s/%s",
-        complexity, backend.name, actual_model,
-    )
-
-    if backend.type == "cli":
-        return await _handle_cli(backend, body, stream)
     return await _handle_openai_compatible(backend, body, stream)
 
 

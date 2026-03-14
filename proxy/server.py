@@ -39,6 +39,7 @@ config: ProxyConfig
 http_client: httpx.AsyncClient
 gemini_client = None  # Lazy-initialized GeminiClient
 _gemini_lock: asyncio.Lock
+_gemini_sessions: dict[str, Any] = {}  # conversation_id -> ChatSession
 auth_manager: AuthManager
 context_manager: ContextManager
 
@@ -46,6 +47,7 @@ context_manager: ContextManager
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global config, http_client, _gemini_lock, auth_manager, context_manager
+    global _gemini_sessions
     config = load_config()
     # Optimized HTTP client: connection pooling, keep-alive, faster timeouts
     http_client = httpx.AsyncClient(
@@ -58,6 +60,7 @@ async def lifespan(app: FastAPI):
         http2=True,
     )
     _gemini_lock = asyncio.Lock()
+    _gemini_sessions = {}  # Reset on startup
     auth_manager = AuthManager()
     context_manager = ContextManager()
 
@@ -635,6 +638,50 @@ async def _get_gemini_client(backend: BackendConfig):
             raise
 
 
+def _estimate_complexity(messages: list[dict]) -> str:
+    """Estimate prompt complexity for routing and logging decisions.
+
+    Returns 'low', 'medium', or 'high' based on message length and keywords.
+    Used by tests and can inform future smart-routing logic.
+    """
+    _HIGH_KEYWORDS = {
+        "refactor", "redesign", "architect", "implement entire", "rewrite",
+        "entire", "comprehensive", "all files", "system", "integrate",
+    }
+    total_chars = sum(len(str(m.get("content", ""))) for m in messages)
+    if len(messages) >= 8 or total_chars >= 3000:
+        return "high"
+    combined = " ".join(str(m.get("content", "")).lower() for m in messages)
+    if any(kw in combined for kw in _HIGH_KEYWORDS):
+        return "high"
+    if total_chars >= 500:
+        return "medium"
+    return "low"
+
+
+def _get_or_create_gemini_session(conv_id: str, client: Any, model_enum: Any) -> tuple[Any, bool]:
+    """Return an existing ChatSession or create a new one for *conv_id*.
+
+    Returns (session, is_new).  is_new=True means this is the first turn for
+    this conversation — the caller should send the full context prompt.
+
+    Synchronous: ChatSession.start_chat() requires no await.  FIFO eviction
+    when the cache grows past 50 sessions to bound memory use.
+    """
+    global _gemini_sessions
+    if conv_id in _gemini_sessions:
+        return _gemini_sessions[conv_id], False
+    # FIFO eviction — Python 3.7+ dicts preserve insertion order
+    if len(_gemini_sessions) >= 50:
+        oldest = next(iter(_gemini_sessions))
+        del _gemini_sessions[oldest]
+        logger.debug("Evicted Gemini session: %s", oldest[:8])
+    session = client.start_chat(model=model_enum)
+    _gemini_sessions[conv_id] = session
+    logger.debug("Created Gemini ChatSession for conv %s", conv_id[:8])
+    return session, True
+
+
 def _flatten_messages(messages: list[dict]) -> tuple[str, list[bytes]]:
     """Flatten OpenAI messages array into a (prompt, files) tuple.
 
@@ -661,7 +708,7 @@ def _flatten_messages(messages: list[dict]) -> tuple[str, list[bytes]]:
                             # data:<mime>;base64,<data>
                             try:
                                 header, b64 = url.split(",", 1)
-                                files.append(base64.b64decode(b64))
+                                files.append(base64.b64decode(b64, validate=True))
                             except Exception:
                                 text_pieces.append("[image attachment]")
                         elif url:
@@ -678,39 +725,30 @@ async def _handle_gemini_web(
     backend: BackendConfig, body: dict, stream: bool,
     conversation_id: str = "",
 ) -> JSONResponse | StreamingResponse:
-    """Chat via Gemini Web (browser session — generous quota, no API key needed).
+    """Chat via Gemini Web using a persistent ChatSession per conversation.
 
-    Supports @file, @folder, @diff, @terminal context injection via message flattening.
-    Uses smart incremental context — only sends full context on first turn.
+    Session strategy:
+      - First turn: full context (system + files + user message), creates new ChatSession.
+      - Subsequent turns: only the latest user message — ChatSession maintains history
+        natively via Gemini's cid/rcid, so no context re-sending and no quota waste.
+      - On error: only the affected session is killed; other conversations are unaffected.
+
+    Streaming: uses send_message_stream() for real token-by-token output
+    via ModelOutput.text_delta, replacing the previous word-batch simulation.
     """
-    global gemini_client
     messages = body.get("messages", [])
     model_str = body.get("model", "gemini-3.0-flash")
-
-    # Use smart context manager for incremental context
-    if conversation_id:
-        full_prompt, image_files = context_manager.build_prompt(
-            conversation_id, messages, "gemini_web",
-        )
-    else:
-        full_prompt, image_files = _flatten_messages(messages)
 
     # Resolve model string → gemini_webapi.constants.Model enum
     from gemini_webapi.constants import Model as _Model
     enum_key = _GEMINI_WEB_MODEL_MAP.get(model_str, _GEMINI_WEB_DEFAULT_MODEL)
     model_enum = getattr(_Model, enum_key, _Model.UNSPECIFIED)
-    logger.debug("Gemini Web: model=%s → enum=%s, attachments=%d", model_str, enum_key, len(image_files))
 
-    # Convert any URL-encoded entries back to str for gemini_webapi
-    files_arg = [f.decode() if f.startswith(b"http") else f for f in image_files] or None
-
+    # Ensure the shared GeminiClient is initialised before accessing sessions
     try:
         client = await _get_gemini_client(backend)
-        response = await client.generate_content(full_prompt, files=files_arg, model=model_enum)
-        text = response.text or ""
     except Exception as e:
-        gemini_client = None  # Reset so next request retries fresh
-        logger.error("Gemini Web error: %s", e)
+        logger.error("Gemini client init failed: %s", e)
         return JSONResponse(
             status_code=503,
             content={"error": {
@@ -726,36 +764,91 @@ async def _handle_gemini_web(
             }},
         )
 
+    # Per-conversation ChatSession — the core fix for quota waste + looping
+    session, is_new_session = _get_or_create_gemini_session(
+        conversation_id, client, model_enum
+    )
+
+    if is_new_session:
+        # First turn: send full context (smart-compressed in build_prompt)
+        prompt, image_files = context_manager.build_prompt(
+            conversation_id, messages, "gemini_web",
+        )
+        logger.info(
+            "Gemini Web [%s]: NEW session, first turn, %d chars",
+            conversation_id[:8], len(prompt),
+        )
+    else:
+        # Subsequent turns: only the latest user message
+        # ChatSession natively maintains conversation history with Gemini
+        prompt, image_files = context_manager.extract_latest_user_message(messages)
+        logger.info(
+            "Gemini Web [%s]: existing session, %d chars (user msg only)",
+            conversation_id[:8], len(prompt),
+        )
+
+    files_arg = [f.decode() if f.startswith(b"http") else f for f in image_files] or None
     cid = f"chatcmpl-{uuid.uuid4().hex[:8]}"
     ts = int(time.time())
+    logger.debug(
+        "Gemini Web: model=%s enum=%s new_session=%s files=%d prompt_chars=%d",
+        model_str, enum_key, is_new_session, len(image_files), len(prompt),
+    )
 
-    if not stream:
-        return JSONResponse(content={
-            "id": cid,
-            "object": "chat.completion",
-            "created": ts,
-            "model": model_str,
-            "choices": [{"index": 0,
-                "message": {"role": "assistant", "content": text},
-                "finish_reason": "stop"}],
-        })
+    try:
+        if not stream:
+            response = await session.send_message(prompt, files=files_arg)
+            text = response.text or ""
+            return JSONResponse(content={
+                "id": cid,
+                "object": "chat.completion",
+                "created": ts,
+                "model": model_str,
+                "choices": [{"index": 0,
+                    "message": {"role": "assistant", "content": text},
+                    "finish_reason": "stop"}],
+            })
 
-    # Streaming simulation: emit OpenAI SSE contract that Continue expects.
-    # Chunks at 4 words for faster perceived responsiveness.
-    async def _stream() -> AsyncIterator[bytes]:
-        yield f"data: {json.dumps({'id': cid, 'object': 'chat.completion.chunk', 'created': ts, 'model': model_str, 'choices': [{'index': 0, 'delta': {'role': 'assistant', 'content': ''}, 'finish_reason': None}]})}\n\n".encode()
-        # Stream in small chunks for fast rendering
-        batch_size = 4
-        words = text.split(" ")
-        for i in range(0, len(words), batch_size):
-            piece = " ".join(words[i:i + batch_size])
-            if i + batch_size < len(words):
-                piece += " "
-            yield f"data: {json.dumps({'id': cid, 'object': 'chat.completion.chunk', 'created': ts, 'model': model_str, 'choices': [{'index': 0, 'delta': {'content': piece}, 'finish_reason': None}]})}\n\n".encode()
-        yield f"data: {json.dumps({'id': cid, 'object': 'chat.completion.chunk', 'created': ts, 'model': model_str, 'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'stop'}]})}\n\n".encode()
-        yield b"data: [DONE]\n\n"
+        # Real streaming via send_message_stream — ModelOutput.text_delta gives
+        # only the NEW characters per yield (no need to diff accumulated text).
+        async def _stream() -> AsyncIterator[bytes]:
+            yield f"data: {json.dumps({'id': cid, 'object': 'chat.completion.chunk', 'created': ts, 'model': model_str, 'choices': [{'index': 0, 'delta': {'role': 'assistant', 'content': ''}, 'finish_reason': None}]})}\n\n".encode()
+            try:
+                async for output in session.send_message_stream(prompt, files=files_arg):
+                    delta = output.text_delta or ""
+                    if delta:
+                        yield f"data: {json.dumps({'id': cid, 'object': 'chat.completion.chunk', 'created': ts, 'model': model_str, 'choices': [{'index': 0, 'delta': {'content': delta}, 'finish_reason': None}]})}\n\n".encode()
+            except Exception as stream_err:
+                logger.error(
+                    "Gemini Web stream error [%s]: %s", conversation_id[:8], stream_err
+                )
+                # Kill session so next request gets a fresh one with full context
+                _gemini_sessions.pop(conversation_id, None)
+                context_manager.reset_conversation(conversation_id)
+            yield f"data: {json.dumps({'id': cid, 'object': 'chat.completion.chunk', 'created': ts, 'model': model_str, 'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'stop'}]})}\n\n".encode()
+            yield b"data: [DONE]\n\n"
 
-    return StreamingResponse(_stream(), media_type="text/event-stream")
+        return StreamingResponse(_stream(), media_type="text/event-stream")
+
+    except Exception as e:
+        # Only kill THIS conversation's session — the shared GeminiClient stays alive
+        _gemini_sessions.pop(conversation_id, None)
+        context_manager.reset_conversation(conversation_id)
+        logger.error("Gemini Web error [%s]: %s", conversation_id[:8], e)
+        return JSONResponse(
+            status_code=503,
+            content={"error": {
+                "message": (
+                    f"Gemini Web unavailable: {e}\n\n"
+                    "To fix, choose one of:\n"
+                    "1. Run 'Super Coder: Sign in to Web Service' from VS Code command palette.\n"
+                    "2. POST http://localhost:8000/auth/login?target=gemini\n"
+                    "3. Paste cookies into config.yaml under gemini_web.cookies"
+                ),
+                "type": "gemini_web_error",
+                "code": "gemini_web_unavailable",
+            }},
+        )
 
 
 # ── Copilot Web ────────────────────────────────────────────────────────────────

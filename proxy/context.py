@@ -160,13 +160,14 @@ class ContextManager:
         content_hash = self._hash_content(all_content)
 
         if state.is_first_turn:
-            # First turn: send everything
+            # First turn: send full context (smart-compressed to budget)
             prompt = self._build_full_prompt(
                 system_parts, context_parts, user_parts, assistant_parts,
+                char_budget=char_budget,
             )
             logger.info(
-                "Conversation %s: first turn, full context (%d chars)",
-                conversation_id[:8], len(prompt),
+                "Conversation %s: first turn, full context (%d chars, budget=%d)",
+                conversation_id[:8], len(prompt), char_budget,
             )
         else:
             # Subsequent turns: incremental
@@ -250,6 +251,106 @@ class ContextManager:
         return "\n".join(text_pieces), files
 
     @staticmethod
+    def _compress_system_prompt(text: str, budget: int) -> str:
+        """Compress a Continue.dev system prompt to fit *budget* chars.
+
+        Strategy: score each line by how actionable it is (must/never/always/
+        do/don't/should/avoid), keep top-scoring lines while preserving original
+        order.  This typically drops ~60% of the generic framing prose while
+        keeping all the actual coding rules.
+        """
+        if len(text) <= budget:
+            return text
+
+        _PRIORITY_WORDS = {
+            "must", "never", "always", "should not",
+            "avoid", "rule:", "important:", "note:",
+            "format:", "make sure", "ensure",
+            "do not", "you must", "you should",
+        }
+        lines = text.splitlines()
+        scored: list[tuple[int, int, str]] = []
+        for i, line in enumerate(lines):
+            ll = line.lower()
+            score = 1
+            if any(w in ll for w in _PRIORITY_WORDS):
+                score += 3
+            if line.startswith("#"):       # heading
+                score += 2
+            if line.startswith("-") or line.startswith("*"):  # bullet
+                score += 1
+            if len(line) > 300:            # very long → lower priority
+                score -= 1
+            scored.append((score, i, line))
+
+        scored.sort(key=lambda x: (-x[0], x[1]))
+        selected: set[int] = set()
+        total = 0
+        for _, i, line in scored:
+            if total + len(line) + 1 > budget:
+                break
+            selected.add(i)
+            total += len(line) + 1
+
+        return "\n".join(lines[i] for i in sorted(selected))
+
+    @staticmethod
+    def _compress_file_content(text: str, max_lines: int = 100) -> str:
+        """Truncate large file/code blocks to *max_lines*.
+
+        Preserves the opening header (file path + opening fence) and appends a
+        concise truncation notice so Gemini knows the file was clipped.
+        """
+        lines = text.splitlines()
+        if len(lines) <= max_lines:
+            return text
+
+        omitted = len(lines) - max_lines
+        kept = lines[:max_lines]
+
+        # If the kept block opened a fence but never closed it, close it
+        fence_count = sum(1 for l in kept if l.startswith("```"))
+        suffix = f"\n... ({omitted} lines truncated)"
+        if fence_count % 2 != 0:          # odd → unclosed fence
+            suffix = "\n```" + suffix
+
+        return "\n".join(kept) + suffix
+
+    @classmethod
+    def _compress_context_items(
+        cls, context_parts: list[str], budget: int
+    ) -> str:
+        """Compress context items to fit *budget* chars.
+
+        Priority: later items (more recently added by the user) are kept first.
+        Each item is individually file-content-compressed before fitting.
+        Oldest items are dropped first when the total exceeds the budget.
+        """
+        if not context_parts:
+            return ""
+
+        # Compress each item individually
+        compressed = [cls._compress_file_content(p) for p in context_parts]
+
+        # Check total before any dropping
+        joined = "\n---\n".join(compressed)
+        if len(joined) <= budget:
+            return joined
+
+        # Drop from the oldest (front) until we fit
+        while len(compressed) > 1:
+            compressed.pop(0)  # remove oldest
+            joined = "\n---\n".join(compressed)
+            if len(joined) <= budget:
+                return joined
+
+        # Single item still too large — hard-trim
+        single = compressed[0]
+        if len(single) > budget:
+            single = single[:budget] + "\n... (truncated for length)"
+        return single
+
+    @staticmethod
     def _looks_like_context(text: str) -> bool:
         """Heuristic: detect if text is a context injection vs user query.
 
@@ -278,22 +379,69 @@ class ContextManager:
         context_parts: list[str],
         user_parts: list[str],
         assistant_parts: list[str],
+        char_budget: int = 0,
     ) -> str:
-        """Build a full prompt with all context."""
+        """Build a smart-compressed first-turn prompt.
+
+        Compression is applied only when *char_budget* > 0 (i.e., when the raw
+        prompt would exceed the model's limit).  The strategy is:
+          1. Always include the latest user query in full.
+          2. Compress the system prompt (keep actionable rules, drop boilerplate).
+          3. Compress context files (trim large code blocks to 100 lines each).
+          4. Drop oldest context items first if still over budget.
+
+        Edge-case: Continue.dev often sends context + the user question inside a
+        single user message.  _looks_like_context may classify the whole thing as
+        "context", leaving user_parts empty.  We recover the user question by
+        splitting the last context item at its last double-newline and treating
+        the short trailing paragraph as the true user message.
+        """
+        # --- Recover user question if buried in last context item ---
+        context_parts = list(context_parts)  # don't mutate caller's list
+        user_parts = list(user_parts)
+        if not user_parts and context_parts:
+            last_item = context_parts[-1]
+            sep = last_item.rfind("\n\n")
+            if sep >= 0:
+                tail = last_item[sep + 2:].strip()
+                # Short, non-code tail → treat as user question
+                if 0 < len(tail) < 400 and not tail.startswith("```"):
+                    context_parts[-1] = last_item[:sep]
+                    user_parts = [tail]
+
+        user_msg = user_parts[-1] if user_parts else ""
+
+        if char_budget > 0 and char_budget < 500_000:  # only compress if budget is meaningful
+            # Reserve at least the user message + some header space
+            overhead = len(user_msg) + 200
+            remaining = max(0, char_budget - overhead)
+
+            sys_budget = int(remaining * 0.30)
+            ctx_budget = int(remaining * 0.60)
+
+            sys_text = ContextManager._compress_system_prompt(
+                "\n".join(system_parts), sys_budget
+            )
+            ctx_text = ContextManager._compress_context_items(context_parts, ctx_budget)
+        else:
+            sys_text = "\n".join(system_parts)
+            ctx_text = "\n---\n".join(
+                ContextManager._compress_file_content(p) for p in context_parts
+            )
+
         sections: list[str] = []
+        if sys_text.strip():
+            sections.append("SYSTEM:\n" + sys_text)
+        if ctx_text.strip():
+            sections.append("CONTEXT:\n" + ctx_text)
 
-        if system_parts:
-            sections.append("SYSTEM:\n" + "\n".join(system_parts))
-
-        if context_parts:
-            sections.append("CONTEXT:\n" + "\n---\n".join(context_parts))
-
-        # Interleave user and assistant turns
-        for i, user_msg in enumerate(user_parts):
-            sections.append(f"USER: {user_msg}")
+        # Interleave previous user/assistant turns (all but the last user msg)
+        for i, u in enumerate(user_parts[:-1]):
+            sections.append(f"USER: {u}")
             if i < len(assistant_parts):
                 sections.append(f"ASSISTANT: {assistant_parts[i]}")
 
+        sections.append(f"USER: {user_msg}")
         return "\n\n".join(sections)
 
     @staticmethod
@@ -352,6 +500,28 @@ class ContextManager:
         end = prompt[-end_budget:]
 
         return start + "\n\n[... middle of conversation trimmed for length ...]\n\n" + end
+
+    def extract_latest_user_message(
+        self, messages: list[dict[str, Any]]
+    ) -> tuple[str, list[bytes]]:
+        """Return only the latest user message and its attached files.
+
+        Called on subsequent turns when a ChatSession is active — no need to
+        re-send the full context history since Gemini natively maintains it.
+        Falls back to an empty string if no user message is found.
+        """
+        for msg in reversed(messages):
+            if msg.get("role") == "user":
+                return self._extract_content(msg.get("content", ""))
+        return "", []
+
+    def is_new_conversation(self, conversation_id: str) -> bool:
+        """Return True if this conversation_id has never been processed.
+
+        Non-mutating — does not create state.
+        """
+        state = self._conversations.get(conversation_id)
+        return state is None or state.is_first_turn
 
     def reset_conversation(self, conversation_id: str) -> None:
         """Reset state for a conversation (e.g., when user starts new session)."""

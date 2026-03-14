@@ -12,7 +12,7 @@ import yaml
 @dataclass
 class BackendConfig:
     name: str
-    type: str  # "openai_compatible", "anthropic", "cli", "gemini_web", or "gemini"
+    type: str  # "openai_compatible", "anthropic", "cli", "gemini_web", "gemini", or "copilot_web"
     base_url: str | None = None
     api_key: str | None = None
     cli_binary: str | None = None  # For type="cli": the binary to invoke

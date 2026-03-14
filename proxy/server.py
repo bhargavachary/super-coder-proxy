@@ -6,6 +6,7 @@ Exposes /v1/chat/completions and routes to:
   3. GitHub Copilot CLI
   4. Gemini Web (browser cookies)
   5. Gemini API (Google AI Studio)
+  6. Copilot Web (Microsoft Copilot browser session)
 """
 
 from __future__ import annotations
@@ -19,13 +20,17 @@ import tempfile
 import time
 import uuid
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import AsyncIterator
 
 import httpx
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
+from starlette.responses import Response as StarletteResponse
 
+from .auth import AuthManager
 from .config import BackendConfig, ProxyConfig, load_config
+from .context import ContextManager
 
 logger = logging.getLogger("super-coder")
 
@@ -33,14 +38,31 @@ config: ProxyConfig
 http_client: httpx.AsyncClient
 gemini_client = None  # Lazy-initialized GeminiClient
 _gemini_lock: asyncio.Lock
+auth_manager: AuthManager
+context_manager: ContextManager
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global config, http_client, _gemini_lock
+    global config, http_client, _gemini_lock, auth_manager, context_manager
     config = load_config()
-    http_client = httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=10.0))
+    # Optimized HTTP client: connection pooling, keep-alive, faster timeouts
+    http_client = httpx.AsyncClient(
+        timeout=httpx.Timeout(120.0, connect=5.0),
+        limits=httpx.Limits(
+            max_connections=20,
+            max_keepalive_connections=10,
+            keepalive_expiry=30,
+        ),
+        http2=True,
+    )
     _gemini_lock = asyncio.Lock()
+    auth_manager = AuthManager()
+    context_manager = ContextManager()
+
+    # Auto-inject persisted auth cookies into backend configs
+    _inject_auth_cookies()
+
     logger.info(
         "Proxy router started on %s:%s with %d backends, %d aliases",
         config.host, config.port, len(config.backends), len(config.aliases),
@@ -52,7 +74,126 @@ async def lifespan(app: FastAPI):
     await http_client.aclose()
 
 
+def _inject_auth_cookies():
+    """Inject persisted auth session cookies into backend configs.
+
+    If a backend has no explicit cookies but we have a saved session,
+    auto-fill it so the user doesn't need to paste cookies manually.
+    """
+    # Gemini Web
+    gemini_backend = config.backends.get("gemini_web")
+    if gemini_backend and gemini_backend.type == "gemini_web" and not gemini_backend.cookies:
+        saved = auth_manager.get_cookies("gemini")
+        if saved:
+            gemini_backend.cookies = saved
+            logger.info("Injected saved Gemini session cookies into gemini_web backend")
+
+    # Copilot Web
+    copilot_backend = config.backends.get("copilot_web")
+    if copilot_backend and copilot_backend.type == "copilot_web" and not copilot_backend.cookies:
+        saved = auth_manager.get_cookies("copilot")
+        if saved:
+            copilot_backend.cookies = saved
+            logger.info("Injected saved Copilot session cookies into copilot_web backend")
+
+
 app = FastAPI(title="Super Coder", lifespan=lifespan)
+
+
+# ── Latency tracking middleware ────────────────────────────────────────────────
+
+@app.middleware("http")
+async def latency_middleware(request: Request, call_next):
+    """Track and log request latency for optimization."""
+    start = time.time()
+    response = await call_next(request)
+    elapsed_ms = (time.time() - start) * 1000
+    response.headers["X-Response-Time-Ms"] = f"{elapsed_ms:.0f}"
+    if request.url.path == "/v1/chat/completions":
+        logger.info("Request latency: %.0fms %s", elapsed_ms, request.url.path)
+    return response
+
+
+# ── Embedded Web Chat Reverse Proxy ───────────────────────────────────────────
+
+_WEB_TARGETS = {
+    "gemini": "https://gemini.google.com",
+    "copilot": "https://copilot.microsoft.com",
+}
+
+
+@app.api_route(
+    "/web/{target}/{path:path}",
+    methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+)
+async def web_proxy(target: str, path: str, request: Request):
+    """Reverse-proxy web chat services with frame-blocking header removal.
+
+    Enables embedding gemini.google.com and copilot.microsoft.com in VS Code
+    webview iframes by stripping X-Frame-Options and CSP frame-ancestors.
+    """
+    base_url = _WEB_TARGETS.get(target)
+    if not base_url:
+        raise HTTPException(404, f"Unknown web target: {target}")
+
+    cookies = auth_manager.get_cookies(target) or {}
+
+    url = f"{base_url}/{path}" if path else f"{base_url}/"
+    # Forward headers but replace host/origin/referer
+    forwarded_headers = {
+        k: v
+        for k, v in request.headers.items()
+        if k.lower() not in ("host", "origin", "referer", "connection")
+    }
+    forwarded_headers["host"] = base_url.split("//")[1]
+    forwarded_headers["referer"] = f"{base_url}/"
+
+    query = str(request.url.query)
+    if query:
+        url = f"{url}?{query}"
+
+    if request.method == "GET":
+        resp = await http_client.get(
+            url, headers=forwarded_headers, cookies=cookies, follow_redirects=True,
+        )
+    else:
+        body = await request.body()
+        resp = await http_client.request(
+            request.method, url, headers=forwarded_headers, cookies=cookies,
+            content=body, follow_redirects=True,
+        )
+
+    # Strip frame-blocking headers so VS Code webview iframe can render
+    response_headers = dict(resp.headers)
+    for h in (
+        "x-frame-options",
+        "content-security-policy",
+        "content-security-policy-report-only",
+    ):
+        response_headers.pop(h, None)
+
+    # Rewrite absolute paths in HTML responses to route through proxy
+    content = resp.content
+    content_type = response_headers.get("content-type", "")
+    if "text/html" in content_type:
+        text = content.decode("utf-8", errors="replace")
+        text = text.replace('href="/', f'href="/web/{target}/')
+        text = text.replace("href='/", f"href='/web/{target}/")
+        text = text.replace('src="/', f'src="/web/{target}/')
+        text = text.replace("src='/", f"src='/web/{target}/")
+        text = text.replace('action="/', f'action="/web/{target}/')
+        content = text.encode("utf-8")
+        # Update content-length since rewriting may change size
+        response_headers.pop("content-length", None)
+
+    # Drop transfer-encoding since we have the full body
+    response_headers.pop("transfer-encoding", None)
+
+    return StarletteResponse(
+        content=content,
+        status_code=resp.status_code,
+        headers=response_headers,
+    )
 
 
 @app.get("/v1/models")
@@ -74,12 +215,19 @@ async def chat_completions(request: Request):
     model_requested = body.get("model", "best")
     stream = body.get("stream", False)
 
+    # Extract or generate conversation ID for incremental context
+    conversation_id = (
+        body.pop("conversation_id", None)
+        or request.headers.get("x-conversation-id")
+        or f"auto-{uuid.uuid4().hex[:12]}"
+    )
+
     backend, actual_model = config.resolve_model(model_requested)
     body["model"] = actual_model
 
     logger.info(
-        "Routing '%s' -> backend=%s model=%s stream=%s",
-        model_requested, backend.name, actual_model, stream,
+        "Routing '%s' -> backend=%s model=%s stream=%s conv=%s",
+        model_requested, backend.name, actual_model, stream, conversation_id[:12],
     )
 
     if backend.type == "anthropic":
@@ -87,7 +235,9 @@ async def chat_completions(request: Request):
     if backend.type == "cli":
         return await _handle_cli(backend, body, stream)
     if backend.type == "gemini_web":
-        return await _handle_gemini_web(backend, body, stream)
+        return await _handle_gemini_web(backend, body, stream, conversation_id)
+    if backend.type == "copilot_web":
+        return await _handle_copilot_web(backend, body, stream, conversation_id)
     if backend.type == "gemini":
         return await _handle_gemini(backend, body, stream)
     return await _handle_openai_compatible(backend, body, stream)
@@ -394,18 +544,10 @@ async def _get_gemini_client(backend: BackendConfig):
 
     Cookie resolution order (first success wins):
     1. Explicit cookies in backend config (most reliable — paste from Chrome DevTools)
-    2. Auto-extract from Chrome via browser_cookie3 (convenient, may prompt for Keychain)
+    2. Saved session from auth manager (native browser login via /auth/login)
+    3. Auto-extract from Chrome via browser_cookie3 (convenient, may prompt for Keychain)
 
     Thread-safe via asyncio.Lock. Resets on error so the next call retries fresh.
-
-    To set explicit cookies, add to config.yaml:
-        backends:
-          gemini_web:
-            type: gemini_web
-            cookies:
-              __Secure-1PSID: "<value>"
-              __Secure-1PSIDTS: "<value>"
-        (Chrome DevTools → Application → Cookies → https://gemini.google.com)
     """
     global gemini_client, _gemini_lock
     if gemini_client is not None:
@@ -432,10 +574,26 @@ async def _get_gemini_client(backend: BackendConfig):
             except Exception as e:
                 gemini_client = None
                 logger.warning(
-                    "Config cookies failed (%s) — trying browser auto-extract...", e
+                    "Config cookies failed (%s) — trying saved auth session...", e
                 )
 
-        # ── Priority 2: Auto-extract from Chrome via browser_cookie3 ───────
+        # ── Priority 2: Saved session from native browser login ────────────
+        saved_cookies = auth_manager.get_cookies("gemini")
+        if saved_cookies and saved_cookies.get("__Secure-1PSID"):
+            logger.info("Trying Gemini Web client from saved auth session...")
+            try:
+                client = _GeminiClient(cookies=saved_cookies)
+                await client.init(timeout=30, verbose=False)
+                gemini_client = client
+                logger.info("Gemini Web client initialized from saved auth session ✓")
+                return gemini_client
+            except Exception as e:
+                gemini_client = None
+                logger.warning(
+                    "Saved auth session failed (%s) — trying browser auto-extract...", e
+                )
+
+        # ── Priority 3: Auto-extract from Chrome via browser_cookie3 ───────
         logger.info(
             "Initializing Gemini Web client via Chrome cookies (browser_cookie3)..."
         )
@@ -452,18 +610,11 @@ async def _get_gemini_client(backend: BackendConfig):
 
             if not cookies.get("__Secure-1PSID"):
                 raise ValueError(
-                    "__Secure-1PSID not found in Chrome cookies.\n"
+                    "__Secure-1PSID not found.\n"
                     "Fix options:\n"
-                    "  A) Open Chrome, sign in at gemini.google.com, restart proxy.\n"
-                    "  B) Paste cookies into config.yaml (most reliable):\n"
-                    "       backends:\n"
-                    "         gemini_web:\n"
-                    "           type: gemini_web\n"
-                    "           cookies:\n"
-                    "             __Secure-1PSID: '<value>'\n"
-                    "             __Secure-1PSIDTS: '<value>'\n"
-                    "     Get values: Chrome DevTools (F12) → Application → "
-                    "Cookies → https://gemini.google.com"
+                    "  A) Use native login: POST http://localhost:8000/auth/login?target=gemini\n"
+                    "  B) Open Chrome, sign in at gemini.google.com, restart proxy.\n"
+                    "  C) Paste cookies into config.yaml under gemini_web.cookies"
                 )
 
             client = _GeminiClient(
@@ -483,54 +634,78 @@ async def _get_gemini_client(backend: BackendConfig):
             raise
 
 
-def _flatten_messages(messages: list[dict]) -> str:
-    """Flatten OpenAI messages array into a single prompt string.
+def _flatten_messages(messages: list[dict]) -> tuple[str, list[bytes]]:
+    """Flatten OpenAI messages array into a (prompt, files) tuple.
 
     Handles multi-part content (list of {type, text/image_url} dicts) that
-    Continue.dev produces when @file or @folder context is injected.
+    Continue.dev produces when @file, @folder context or image attachments are
+    injected. Images are extracted as raw bytes so callers can pass them to
+    APIs that support native file uploads (e.g. gemini_webapi generate_content).
     """
+    import base64
     parts = []
+    files: list[bytes] = []
     for m in messages:
         role = m["role"].upper()
         content = m.get("content", "")
         if isinstance(content, list):
-            # Multi-part content from @file / @folder context providers
             text_pieces = []
             for part in content:
                 if isinstance(part, dict):
                     if part.get("type") == "text":
                         text_pieces.append(part.get("text", ""))
                     elif part.get("type") == "image_url":
-                        text_pieces.append("[image attachment]")
+                        url = part.get("image_url", {}).get("url", "")
+                        if url.startswith("data:"):
+                            # data:<mime>;base64,<data>
+                            try:
+                                header, b64 = url.split(",", 1)
+                                files.append(base64.b64decode(b64))
+                            except Exception:
+                                text_pieces.append("[image attachment]")
+                        elif url:
+                            # Remote URL — pass as string path to gemini_webapi
+                            files.append(url.encode())  # stored as bytes, decoded at call site
                 else:
                     text_pieces.append(str(part))
             content = "\n".join(text_pieces)
         parts.append(f"{role}: {content}")
-    return "\n\n".join(parts)
+    return "\n\n".join(parts), files
 
 
 async def _handle_gemini_web(
-    backend: BackendConfig, body: dict, stream: bool
+    backend: BackendConfig, body: dict, stream: bool,
+    conversation_id: str = "",
 ) -> JSONResponse | StreamingResponse:
     """Chat via Gemini Web (browser session — generous quota, no API key needed).
 
     Supports @file, @folder, @diff, @terminal context injection via message flattening.
-    Does NOT support function/tool calling.
+    Uses smart incremental context — only sends full context on first turn.
     """
     global gemini_client
     messages = body.get("messages", [])
     model_str = body.get("model", "gemini-3.0-flash")
-    full_prompt = _flatten_messages(messages)
+
+    # Use smart context manager for incremental context
+    if conversation_id:
+        full_prompt, image_files = context_manager.build_prompt(
+            conversation_id, messages, "gemini_web",
+        )
+    else:
+        full_prompt, image_files = _flatten_messages(messages)
 
     # Resolve model string → gemini_webapi.constants.Model enum
     from gemini_webapi.constants import Model as _Model
     enum_key = _GEMINI_WEB_MODEL_MAP.get(model_str, _GEMINI_WEB_DEFAULT_MODEL)
     model_enum = getattr(_Model, enum_key, _Model.UNSPECIFIED)
-    logger.debug("Gemini Web: model=%s → enum=%s", model_str, enum_key)
+    logger.debug("Gemini Web: model=%s → enum=%s, attachments=%d", model_str, enum_key, len(image_files))
+
+    # Convert any URL-encoded entries back to str for gemini_webapi
+    files_arg = [f.decode() if f.startswith(b"http") else f for f in image_files] or None
 
     try:
         client = await _get_gemini_client(backend)
-        response = await client.generate_content(full_prompt, model=model_enum)
+        response = await client.generate_content(full_prompt, files=files_arg, model=model_enum)
         text = response.text or ""
     except Exception as e:
         gemini_client = None  # Reset so next request retries fresh
@@ -541,9 +716,9 @@ async def _handle_gemini_web(
                 "message": (
                     f"Gemini Web unavailable: {e}\n\n"
                     "To fix, choose one of:\n"
-                    "1. Open Chrome and sign in at gemini.google.com, then restart the proxy.\n"
-                    "2. Paste cookies into config.yaml under gemini_web.cookies\n"
-                    "   (Chrome DevTools F12 → Application → Cookies → gemini.google.com)"
+                    "1. Run 'Super Coder: Sign in to Web Service' from VS Code command palette.\n"
+                    "2. POST http://localhost:8000/auth/login?target=gemini\n"
+                    "3. Paste cookies into config.yaml under gemini_web.cookies"
                 ),
                 "type": "gemini_web_error",
                 "code": "gemini_web_unavailable",
@@ -564,22 +739,628 @@ async def _handle_gemini_web(
                 "finish_reason": "stop"}],
         })
 
-    # Streaming simulation: emit OpenAI SSE contract that Continue expects:
-    #   1. Role announcement chunk
-    #   2. Content chunks (word-batched for a natural feel)
-    #   3. Stop chunk  4. [DONE] sentinel
+    # Streaming simulation: emit OpenAI SSE contract that Continue expects.
+    # Chunks at 4 words for faster perceived responsiveness.
     async def _stream() -> AsyncIterator[bytes]:
         yield f"data: {json.dumps({'id': cid, 'object': 'chat.completion.chunk', 'created': ts, 'model': model_str, 'choices': [{'index': 0, 'delta': {'role': 'assistant', 'content': ''}, 'finish_reason': None}]})}\n\n".encode()
+        # Stream in small chunks for fast rendering
+        batch_size = 4
         words = text.split(" ")
-        for i in range(0, len(words), 8):
-            piece = " ".join(words[i:i + 8])
-            if i + 8 < len(words):
+        for i in range(0, len(words), batch_size):
+            piece = " ".join(words[i:i + batch_size])
+            if i + batch_size < len(words):
                 piece += " "
             yield f"data: {json.dumps({'id': cid, 'object': 'chat.completion.chunk', 'created': ts, 'model': model_str, 'choices': [{'index': 0, 'delta': {'content': piece}, 'finish_reason': None}]})}\n\n".encode()
         yield f"data: {json.dumps({'id': cid, 'object': 'chat.completion.chunk', 'created': ts, 'model': model_str, 'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'stop'}]})}\n\n".encode()
         yield b"data: [DONE]\n\n"
 
     return StreamingResponse(_stream(), media_type="text/event-stream")
+
+
+# ── Copilot Web ────────────────────────────────────────────────────────────────
+
+_COPILOT_WEB_STYLE_MAP: dict[str, str] = {
+    "copilot-web-creative": "creative",
+    "copilot-web-precise":  "precise",
+    # default → "balanced"
+}
+
+
+def _get_copilot_u_cookie(backend: BackendConfig) -> str:
+    """Resolve the Bing _U cookie for Copilot Web.
+
+    Priority 1: explicit value in config.yaml cookies._U
+    Priority 2: saved session from native browser login (/auth/login)
+    Priority 3: auto-extract from Chrome via browser_cookie3
+    """
+    if backend.cookies and backend.cookies.get("_U"):
+        return backend.cookies["_U"]
+
+    # Check auth manager for saved session
+    saved = auth_manager.get_cookies("copilot")
+    if saved and saved.get("_U"):
+        logger.info("Copilot Web: _U cookie from saved auth session ✓")
+        return saved["_U"]
+
+    try:
+        import browser_cookie3
+        cj = browser_cookie3.chrome(domain_name=".bing.com")
+        for cookie in cj:
+            if cookie.name == "_U" and cookie.value:
+                logger.info("Copilot Web: _U cookie auto-extracted from Chrome ✓")
+                return cookie.value
+    except Exception as e:
+        logger.debug("browser_cookie3 failed: %s", e)
+
+    raise ValueError(
+        "_U cookie not found.\n"
+        "Fix options:\n"
+        "  A) Use native login: POST http://localhost:8000/auth/login?target=copilot\n"
+        "  B) Open Chrome, sign in at copilot.microsoft.com, restart proxy.\n"
+        "  C) Paste cookie into config.yaml under copilot_web.cookies._U"
+    )
+
+
+async def _handle_copilot_web(
+    backend: BackendConfig, body: dict, stream: bool,
+    conversation_id: str = "",
+) -> JSONResponse | StreamingResponse:
+    """Chat via Microsoft Copilot Web (browser session — no API key needed).
+
+    Uses sydney-py to drive the Copilot WebSocket endpoint with a _U cookie.
+    Uses smart incremental context — only sends full context on first turn.
+    """
+    from sydney import SydneyClient as _SydneyClient
+
+    messages = body.get("messages", [])
+    model_str = body.get("model", "copilot-web")
+
+    # Use smart context manager for incremental context
+    if conversation_id:
+        full_prompt, image_files = context_manager.build_prompt(
+            conversation_id, messages, "copilot_web",
+        )
+    else:
+        full_prompt, image_files = _flatten_messages(messages)
+
+    style = _COPILOT_WEB_STYLE_MAP.get(model_str, "balanced")
+
+    try:
+        u_cookie = _get_copilot_u_cookie(backend)
+    except ValueError as e:
+        logger.error("Copilot Web cookie error: %s", e)
+        return JSONResponse(
+            status_code=503,
+            content={"error": {
+                "message": str(e),
+                "type": "copilot_web_error",
+                "code": "copilot_web_unavailable",
+            }},
+        )
+
+    # Save first image to temp file — sydney-py takes a file path
+    attachment_path: str | None = None
+    if image_files:
+        fd, attachment_path = tempfile.mkstemp(suffix=".jpg")
+        with os.fdopen(fd, "wb") as f:
+            f.write(image_files[0])
+
+    cid = f"chatcmpl-{uuid.uuid4().hex[:8]}"
+    ts = int(time.time())
+    logger.debug("Copilot Web: style=%s attachments=%d", style, len(image_files))
+
+    if not stream:
+        try:
+            async with _SydneyClient(style=style, bing_cookies=u_cookie) as sydney:
+                text = await sydney.ask(full_prompt, attachment=attachment_path)
+                if isinstance(text, tuple):
+                    text = text[0]
+        except Exception as e:
+            logger.error("Copilot Web error: %s", e)
+            return JSONResponse(
+                status_code=503,
+                content={"error": {
+                    "message": f"Copilot Web unavailable: {e}",
+                    "type": "copilot_web_error",
+                    "code": "copilot_web_unavailable",
+                }},
+            )
+        finally:
+            if attachment_path:
+                try:
+                    os.unlink(attachment_path)
+                except Exception:
+                    pass
+        return JSONResponse(content={
+            "id": cid,
+            "object": "chat.completion",
+            "created": ts,
+            "model": model_str,
+            "choices": [{"index": 0,
+                "message": {"role": "assistant", "content": text},
+                "finish_reason": "stop"}],
+        })
+
+    # Streaming — sydney-py yields real token chunks over WebSocket
+    async def _stream() -> AsyncIterator[bytes]:
+        try:
+            async with _SydneyClient(style=style, bing_cookies=u_cookie) as sydney:
+                yield f"data: {json.dumps({'id': cid, 'object': 'chat.completion.chunk', 'created': ts, 'model': model_str, 'choices': [{'index': 0, 'delta': {'role': 'assistant', 'content': ''}, 'finish_reason': None}]})}\n\n".encode()
+                async for chunk in sydney.ask_stream(full_prompt, attachment=attachment_path):
+                    if isinstance(chunk, tuple):
+                        chunk = chunk[0]
+                    if chunk:
+                        yield f"data: {json.dumps({'id': cid, 'object': 'chat.completion.chunk', 'created': ts, 'model': model_str, 'choices': [{'index': 0, 'delta': {'content': chunk}, 'finish_reason': None}]})}\n\n".encode()
+                yield f"data: {json.dumps({'id': cid, 'object': 'chat.completion.chunk', 'created': ts, 'model': model_str, 'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'stop'}]})}\n\n".encode()
+                yield b"data: [DONE]\n\n"
+        except Exception as e:
+            logger.error("Copilot Web stream error: %s", e)
+        finally:
+            if attachment_path:
+                try:
+                    os.unlink(attachment_path)
+                except Exception:
+                    pass
+
+    return StreamingResponse(_stream(), media_type="text/event-stream")
+
+
+# ── Context Bridge — Browser Backend ──────────────────────────────────────────
+
+_BROWSER_PROFILE_DIR = Path.home() / ".config" / "context-bridge" / "profile"
+
+_CHAT_TARGETS: dict[str, str] = {
+    "gemini":  "https://gemini.google.com",
+    "copilot": "https://copilot.microsoft.com",
+    "chatgpt": "https://chatgpt.com",
+    "claude":  "https://claude.ai",
+}
+
+# CSS injected after launch — hides chrome (nav/sidebar) and spotlights the chat
+_FOCUS_CSS: dict[str, str] = {
+    "gemini": """
+        bard-sidenav, .sidenav, mat-drawer, .app-bar-container,
+        c-wiz[data-node-index="0;0"] > div > div:first-child,
+        [jsname="paAFfc"], .new-chat-btn-container { display:none!important; }
+        .chat-history, [class*="conversation-container"] { max-width:100%!important; }
+    """,
+    "copilot": """
+        cib-serp-main::part(header), header, #b_header,
+        .cib-action-bar-main-container, .cib-suggestion-bar { display:none!important; }
+        cib-conversation { height:100vh!important; }
+    """,
+    "chatgpt": """
+        nav, .sidebar, #__next > div > div:first-child,
+        [class*="Sidebar"] { display:none!important; }
+        main { max-width:100%!important; margin:0!important; }
+    """,
+    "claude": """
+        [data-testid="sidebar"], nav, .transition-all.duration-200 { display:none!important; }
+        main { max-width:100%!important; }
+    """,
+}
+
+# JS that grabs the last assistant message text
+_EXTRACT_JS: dict[str, str] = {
+    "gemini":  "const m=document.querySelectorAll('model-response .markdown,.model-response-text');return m.length?m[m.length-1].innerText:'';",
+    "copilot": "const m=document.querySelectorAll('cib-message[source=\"bot\"] .content,.response-message-content');return m.length?m[m.length-1].innerText:'';",
+    "chatgpt": "const m=document.querySelectorAll('[data-message-author-role=\"assistant\"] .markdown');return m.length?m[m.length-1].innerText:'';",
+    "claude":  "const m=document.querySelectorAll('[data-is-streaming=\"false\"] .font-claude-message,.assistant-message');return m.length?m[m.length-1].innerText:'';",
+}
+
+_pw_instance = None
+_pw_context  = None   # BrowserContext (persistent)
+_pw_pages: dict[str, object] = {}  # target -> Page
+_pw_lock = asyncio.Lock()
+
+
+async def _get_browser_page(target: str):
+    """Return (and lazily create) the Playwright page for a given target."""
+    global _pw_instance, _pw_context, _pw_pages
+
+    async with _pw_lock:
+        if target in _pw_pages:
+            return _pw_pages[target]
+
+        from playwright.async_api import async_playwright
+
+        if _pw_instance is None:
+            _pw_instance = await async_playwright().start()
+
+        if _pw_context is None:
+            _BROWSER_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+            _pw_context = await _pw_instance.chromium.launch_persistent_context(
+                str(_BROWSER_PROFILE_DIR),
+                headless=False,
+                channel="chromium",
+                viewport={"width": 1280, "height": 900},
+                args=["--disable-blink-features=AutomationControlled"],
+            )
+
+        page = await _pw_context.new_page()
+        url = _CHAT_TARGETS.get(target, _CHAT_TARGETS["gemini"])
+        await page.goto(url, wait_until="domcontentloaded")
+
+        css = _FOCUS_CSS.get(target, "")
+        if css:
+            await page.add_style_tag(content=css)
+            # Re-inject on every navigation (SPAs replace DOM)
+            page.on("framenavigated", lambda f: asyncio.ensure_future(
+                page.add_style_tag(content=css) if f == page.main_frame else asyncio.sleep(0)
+            ))
+
+        logger.info("Browser page launched: %s → %s", target, url)
+        _pw_pages[target] = page
+        return page
+
+
+@app.post("/browser/launch")
+async def browser_launch(target: str = "gemini"):
+    """Open (or focus) a chat browser tab in focus mode for the given target."""
+    try:
+        page = await _get_browser_page(target)
+        await page.bring_to_front()
+        return {"ok": True, "url": page.url}
+    except Exception as e:
+        logger.error("Browser launch error: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/browser/extract")
+async def browser_extract(target: str = "gemini"):
+    """Extract the last assistant message text from the active chat page."""
+    if target not in _pw_pages:
+        raise HTTPException(status_code=404, detail=f"No browser page open for '{target}'. Launch it first.")
+    try:
+        page = _pw_pages[target]
+        js = _EXTRACT_JS.get(target, "return document.body.innerText;")
+        text = await page.evaluate(f"() => {{ {js} }}")
+        return {"text": text or ""}
+    except Exception as e:
+        logger.error("Browser extract error: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/browser/close")
+async def browser_close(target: str | None = None):
+    """Close one browser page (or all if target is omitted)."""
+    global _pw_context, _pw_pages
+    if target:
+        page = _pw_pages.pop(target, None)
+        if page:
+            await page.close()
+    else:
+        for page in list(_pw_pages.values()):
+            await page.close()
+        _pw_pages.clear()
+        if _pw_context:
+            await _pw_context.close()
+            _pw_context = None
+    return {"ok": True}
+
+
+# ── Context Bridge Panel HTML ──────────────────────────────────────────────────
+
+_CONTEXT_PANEL_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Context Bridge</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    background: #1e1e1e; color: #d4d4d4;
+    display: flex; flex-direction: column; height: 100vh; padding: 12px; gap: 10px;
+  }
+  .toolbar {
+    display: flex; align-items: center; gap: 8px; flex-shrink: 0; flex-wrap: wrap;
+  }
+  .toolbar select, .toolbar button, .toolbar input {
+    background: #2d2d2d; color: #d4d4d4;
+    border: 1px solid #444; border-radius: 4px;
+    padding: 5px 10px; font-size: 13px; cursor: pointer;
+  }
+  .toolbar button {
+    background: #0e639c; border-color: #0e639c; color: #fff;
+    font-weight: 600; padding: 5px 14px;
+  }
+  .toolbar button:hover:not(:disabled) { background: #1177bb; }
+  .toolbar button:disabled { background: #444; border-color: #444; cursor: default; opacity: 0.6; }
+  .toolbar button.secondary { background: #2d2d2d; border-color: #555; color: #ccc; font-weight: 400; }
+  .toolbar button.secondary:hover:not(:disabled) { border-color: #888; color: #fff; }
+  .toolbar label { font-size: 12px; color: #888; white-space: nowrap; }
+  .divider { width: 1px; height: 20px; background: #444; margin: 0 4px; }
+  .panels { display: flex; gap: 10px; flex: 1; min-height: 0; }
+  .pane { display: flex; flex-direction: column; flex: 1; gap: 6px; min-width: 0; }
+  .pane-header { display: flex; align-items: center; gap: 6px; }
+  .pane-label {
+    font-size: 11px; font-weight: 600; color: #888;
+    text-transform: uppercase; letter-spacing: 0.5px; flex: 1;
+  }
+  .pane-btn {
+    font-size: 11px; background: #2d2d2d; border: 1px solid #444;
+    color: #888; border-radius: 4px; padding: 2px 8px; cursor: pointer;
+  }
+  .pane-btn:hover { color: #d4d4d4; border-color: #888; }
+  textarea {
+    flex: 1; background: #2d2d2d; color: #d4d4d4;
+    border: 1px solid #444; border-radius: 4px;
+    padding: 10px; font-size: 13px; font-family: inherit;
+    resize: none; line-height: 1.5;
+  }
+  textarea:focus { outline: none; border-color: #0e639c; }
+  .status { font-size: 12px; color: #888; margin-left: auto; }
+  .status.error { color: #f14c4c; }
+  .status.ok { color: #89d185; }
+  .status.busy { color: #e8bf6a; }
+  .browser-bar {
+    display: flex; align-items: center; gap: 8px;
+    background: #252526; border: 1px solid #333; border-radius: 4px;
+    padding: 6px 10px; flex-shrink: 0;
+  }
+  .browser-bar label { font-size: 12px; color: #888; }
+  .browser-chips { display: flex; gap: 4px; }
+  .chip {
+    font-size: 12px; padding: 3px 10px; border-radius: 12px; cursor: pointer;
+    border: 1px solid #444; background: #2d2d2d; color: #aaa;
+    transition: all .15s;
+  }
+  .chip:hover { border-color: #888; color: #fff; }
+  .chip.active { border-color: #0e639c; background: #0e639c22; color: #4fc3f7; }
+  .auth-bar {
+    display: flex; align-items: center; gap: 8px;
+    background: #252526; border: 1px solid #333; border-radius: 4px;
+    padding: 6px 10px; flex-shrink: 0;
+  }
+  .auth-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+  .auth-dot.ok { background: #89d185; }
+  .auth-dot.no { background: #f14c4c; }
+  .auth-dot.stale { background: #e8bf6a; }
+  .auth-item {
+    font-size: 12px; display: flex; align-items: center; gap: 5px; cursor: pointer;
+    padding: 2px 6px; border-radius: 4px;
+  }
+  .auth-item:hover { background: #333; }
+</style>
+</head>
+<body>
+
+<!-- ── Browser launcher bar ─────────────────────────────────── -->
+<div class="browser-bar">
+  <label>Open in focus mode</label>
+  <div class="browser-chips">
+    <span class="chip" onclick="launchBrowser('gemini')">Gemini</span>
+    <span class="chip" onclick="launchBrowser('copilot')">Copilot</span>
+    <span class="chip" onclick="launchBrowser('chatgpt')">ChatGPT</span>
+    <span class="chip" onclick="launchBrowser('claude')">Claude.ai</span>
+  </div>
+  <div class="divider"></div>
+  <button class="secondary" style="font-size:12px;padding:3px 10px;" onclick="grabFromBrowser()">Grab last response</button>
+  <select id="grab-target" style="font-size:12px;padding:3px 8px;">
+    <option value="gemini">Gemini</option>
+    <option value="copilot">Copilot</option>
+    <option value="chatgpt">ChatGPT</option>
+    <option value="claude">Claude.ai</option>
+  </select>
+</div>
+
+<!-- ── Auth status bar ───────────────────────────────────────── -->
+<div class="auth-bar" id="auth-bar">
+  <span style="font-size:12px;color:#888;">Auth:</span>
+  <span class="auth-item" onclick="toggleAuth('gemini')"><span class="auth-dot no" id="auth-gemini"></span>Gemini</span>
+  <span class="auth-item" onclick="toggleAuth('copilot')"><span class="auth-dot no" id="auth-copilot"></span>Copilot</span>
+  <span class="auth-item" onclick="toggleAuth('chatgpt')"><span class="auth-dot no" id="auth-chatgpt"></span>ChatGPT</span>
+  <span class="auth-item" onclick="toggleAuth('claude')"><span class="auth-dot no" id="auth-claude"></span>Claude</span>
+</div>
+
+<!-- ── Summarizer toolbar ────────────────────────────────────── -->
+<div class="toolbar">
+  <label>Model</label>
+  <select id="model">
+    <option value="gemini-flash-web">Gemini Flash Web</option>
+    <option value="gemini-pro-web">Gemini Pro Web</option>
+    <option value="copilot-web">Copilot Web</option>
+    <option value="claude-smart">Claude Pro</option>
+    <option value="copilot-opus">Copilot Opus</option>
+    <option value="copilot-gpt">Copilot GPT</option>
+  </select>
+  <div class="divider"></div>
+  <label>Mode</label>
+  <select id="preset">
+    <option value="summarize">Summarize as coding context</option>
+    <option value="extract">Extract decisions &amp; constraints</option>
+    <option value="bullets">Bullet-point key facts</option>
+    <option value="custom">Custom...</option>
+  </select>
+  <input id="custom-instruction" placeholder="Enter instruction..."
+    style="display:none; flex:1;" />
+  <button id="run-btn" onclick="run()">Summarize ⌘↵</button>
+  <span id="status" class="status"></span>
+</div>
+
+<!-- ── Two text panes ────────────────────────────────────────── -->
+<div class="panels">
+  <div class="pane">
+    <div class="pane-header">
+      <div class="pane-label">Input — paste or grab from browser</div>
+      <button class="pane-btn" onclick="clearInput()">Clear</button>
+    </div>
+    <textarea id="input" placeholder="Paste any text here, or use 'Grab last response' above to pull from an open browser tab..."></textarea>
+  </div>
+  <div class="pane">
+    <div class="pane-header">
+      <div class="pane-label">Context output — paste into Continue</div>
+      <button class="pane-btn" onclick="copyOutput()">Copy</button>
+    </div>
+    <textarea id="output" placeholder="Summary appears here..." readonly></textarea>
+  </div>
+</div>
+
+<script>
+const PRESETS = {
+  summarize: "Summarize the following into a concise coding context block. Focus on technical decisions, architecture, APIs, constraints, and anything a developer needs to continue the work. Be terse — no preamble.",
+  extract:   "Extract key technical decisions, constraints, and open questions. Short bulleted list. No preamble.",
+  bullets:   "Condense into the most important facts as brief bullet points. Prioritize technical details.",
+};
+
+let activeBrowserTarget = null;
+
+document.getElementById("preset").addEventListener("change", () => {
+  const v = document.getElementById("preset").value;
+  document.getElementById("custom-instruction").style.display = v === "custom" ? "inline-block" : "none";
+});
+
+function setStatus(msg, cls) {
+  const el = document.getElementById("status");
+  el.textContent = msg;
+  el.className = "status" + (cls ? " " + cls : "");
+}
+
+function getInstruction() {
+  const p = document.getElementById("preset").value;
+  return p === "custom" ? document.getElementById("custom-instruction").value.trim() : PRESETS[p];
+}
+
+async function launchBrowser(target) {
+  document.querySelectorAll(".chip").forEach(c => c.classList.remove("active"));
+  document.querySelector(`.chip[onclick*="${target}"]`).classList.add("active");
+  document.getElementById("grab-target").value = target;
+  activeBrowserTarget = target;
+  setStatus("Opening " + target + "...", "busy");
+  try {
+    const r = await fetch("/browser/launch?target=" + target, { method: "POST" });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.detail || r.statusText);
+    setStatus(target + " open ✓", "ok");
+  } catch(e) { setStatus(e.message, "error"); }
+}
+
+async function grabFromBrowser() {
+  const target = document.getElementById("grab-target").value;
+  setStatus("Grabbing from " + target + "...", "busy");
+  try {
+    const r = await fetch("/browser/extract?target=" + target);
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.detail || r.statusText);
+    if (!d.text) { setStatus("No response found yet.", "error"); return; }
+    document.getElementById("input").value = d.text;
+    setStatus("Grabbed ✓", "ok");
+  } catch(e) { setStatus(e.message, "error"); }
+}
+
+function clearInput() { document.getElementById("input").value = ""; }
+
+async function run() {
+  const input = document.getElementById("input").value.trim();
+  if (!input) { setStatus("Nothing to summarize.", "error"); return; }
+  const model = document.getElementById("model").value;
+  const instruction = getInstruction();
+  const btn = document.getElementById("run-btn");
+  btn.disabled = true;
+  setStatus("Running...", "busy");
+  document.getElementById("output").value = "";
+  try {
+    const res = await fetch("/v1/chat/completions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model, stream: true,
+        messages: [
+          { role: "system", content: instruction },
+          { role: "user",   content: input }
+        ]
+      })
+    });
+    if (!res.ok) { const e = await res.json().catch(()=>({})); throw new Error(e?.error?.message || res.statusText); }
+    const reader = res.body.getReader();
+    const dec = new TextDecoder();
+    let out = "";
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      for (const line of dec.decode(value).split("\\n")) {
+        if (!line.startsWith("data: ") || line === "data: [DONE]") continue;
+        try {
+          const delta = JSON.parse(line.slice(6))?.choices?.[0]?.delta?.content;
+          if (delta) { out += delta; document.getElementById("output").value = out; }
+        } catch {}
+      }
+    }
+    setStatus("Done ✓", "ok");
+  } catch(e) {
+    setStatus(e.message, "error");
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+function copyOutput() {
+  const v = document.getElementById("output").value;
+  if (!v) return;
+  navigator.clipboard.writeText(v).then(() => setStatus("Copied ✓", "ok"));
+}
+
+document.addEventListener("keydown", e => {
+  if ((e.metaKey || e.ctrlKey) && e.key === "Enter") run();
+});
+
+// ── Auth status ─────────────────────────────────────────────
+async function loadAuthStatus() {
+  try {
+    const r = await fetch("/auth/status");
+    const d = await r.json();
+    const targets = d.targets || [];
+    for (const info of targets) {
+      const dot = document.getElementById("auth-" + info.target);
+      if (!dot) continue;
+      dot.className = "auth-dot " + (info.authenticated ? "ok" : "no");
+      dot.title = info.authenticated ? "Signed in" : "Not signed in";
+    }
+  } catch {}
+}
+
+async function toggleAuth(target) {
+  const dot = document.getElementById("auth-" + target);
+  if (!dot) return;
+  const wasOk = dot.classList.contains("ok") || dot.classList.contains("stale");
+  if (wasOk) {
+    // Logout
+    dot.className = "auth-dot no";
+    setStatus("Signing out of " + target + "...", "busy");
+    try {
+      await fetch("/auth/logout?target=" + target, { method: "POST" });
+      setStatus(target + " signed out", "ok");
+    } catch(e) { setStatus(e.message, "error"); }
+  } else {
+    // Login
+    dot.className = "auth-dot stale";
+    setStatus("Opening " + target + " login... (complete in browser)", "busy");
+    try {
+      const r = await fetch("/auth/login?target=" + target, { method: "POST" });
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.detail || r.statusText);
+      dot.className = "auth-dot ok";
+      setStatus(target + " signed in ✓", "ok");
+    } catch(e) {
+      dot.className = "auth-dot no";
+      setStatus(e.message, "error");
+    }
+  }
+}
+
+loadAuthStatus();
+</script>
+</body>
+</html>"""
+
+
+@app.get("/context", response_class=None)
+async def context_panel():
+    """Serve the Context Bridge panel."""
+    from fastapi.responses import HTMLResponse
+    return HTMLResponse(_CONTEXT_PANEL_HTML)
 
 
 @app.get("/v1/context/file-tree")
@@ -652,6 +1433,114 @@ async def file_tree(
 @app.get("/health")
 async def health():
     return {"status": "ok", "backends": list(config.backends.keys())}
+
+
+# ── Authentication Endpoints ──────────────────────────────────────────────────
+
+@app.get("/auth/status")
+async def auth_status(target: str | None = None):
+    """Check auth status for one or all web backends."""
+    if target:
+        return auth_manager.status(target)
+    return {"targets": auth_manager.status_all()}
+
+
+@app.post("/auth/login")
+async def auth_login(target: str = "gemini"):
+    """Open a browser window for interactive login. Captures cookies automatically.
+
+    Supported targets: gemini, copilot, chatgpt, claude
+    """
+    try:
+        cookies = await auth_manager.login(target)
+
+        # Inject the new cookies into the running backend config
+        _inject_auth_cookies()
+        # Reset any cached clients so they reinitialize with new cookies
+        global gemini_client
+        if target == "gemini":
+            gemini_client = None
+
+        return {
+            "ok": True,
+            "target": target,
+            "cookies_captured": len(cookies),
+            "message": f"Successfully logged in to {target}. Cookies saved.",
+        }
+    except TimeoutError as e:
+        return JSONResponse(status_code=408, content={"error": str(e)})
+    except ValueError as e:
+        return JSONResponse(status_code=400, content={"error": str(e)})
+    except Exception as e:
+        logger.error("Auth login error for %s: %s", target, e)
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
+@app.post("/auth/logout")
+async def auth_logout(target: str):
+    """Clear saved session for a target."""
+    cleared = await auth_manager.logout(target)
+    return {"ok": True, "cleared": cleared}
+
+
+@app.post("/auth/refresh")
+async def auth_refresh(target: str = "gemini"):
+    """Force re-login (clears old session, opens browser)."""
+    try:
+        cookies = await auth_manager.refresh(target)
+        _inject_auth_cookies()
+        global gemini_client
+        if target == "gemini":
+            gemini_client = None
+        return {
+            "ok": True,
+            "target": target,
+            "cookies_captured": len(cookies),
+        }
+    except TimeoutError as e:
+        return JSONResponse(status_code=408, content={"error": str(e)})
+    except Exception as e:
+        logger.error("Auth refresh error for %s: %s", target, e)
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
+# ── Dynamic Model Discovery ──────────────────────────────────────────────────
+
+@app.get("/v1/backends")
+async def list_backends():
+    """List all backends with their auth status and available models."""
+    result = []
+    for name, bcfg in config.backends.items():
+        entry = {
+            "name": name,
+            "type": bcfg.type,
+            "available": True,
+        }
+
+        # Check auth status for web backends
+        if bcfg.type == "gemini_web":
+            status = auth_manager.status("gemini")
+            entry["authenticated"] = status.get("authenticated", False)
+            entry["auth_target"] = "gemini"
+        elif bcfg.type == "copilot_web":
+            status = auth_manager.status("copilot")
+            entry["authenticated"] = status.get("authenticated", False)
+            entry["auth_target"] = "copilot"
+        elif bcfg.type == "cli":
+            entry["authenticated"] = True  # CLI auth is separate
+        elif bcfg.type in ("openai_compatible", "gemini"):
+            entry["authenticated"] = bool(bcfg.api_key)
+
+        # List aliases that point to this backend
+        entry["models"] = [
+            {"alias": alias, "model": acfg.model}
+            for alias, acfg in config.aliases.items()
+            if acfg.backend == name
+        ]
+
+        result.append(entry)
+
+    return {"backends": result}
 
 
 def main():

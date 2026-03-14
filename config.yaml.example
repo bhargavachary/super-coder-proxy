@@ -77,7 +77,20 @@ aliases:
     backend: ollama
     model: codellama:7b          # ollama pull codellama:7b
 
-  # ── 4. Gemini Web (requires: Chrome signed into gemini.google.com) ─────────
+  # ── 4. Copilot Web (requires: Chrome signed into copilot.microsoft.com) ──────
+  copilot-web:
+    backend: copilot_web
+    model: copilot-web           # balanced style (default)
+
+  copilot-web-creative:
+    backend: copilot_web
+    model: copilot-web-creative  # creative style
+
+  copilot-web-precise:
+    backend: copilot_web
+    model: copilot-web-precise   # precise style
+
+  # ── 5. Gemini Web (requires: Chrome signed into gemini.google.com) ─────────
   gemini-flash-web:
     backend: gemini_web
     model: gemini-3.0-flash      # fast, generous quota
@@ -90,7 +103,7 @@ aliases:
     backend: gemini_web
     model: gemini-3.0-flash-thinking  # extended thinking mode
 
-  # ── 5. Gemini API (requires: export GOOGLE_API_KEY="AIza...") ─────────────
+  # ── 6. Gemini API (requires: export GOOGLE_API_KEY="AIza...") ─────────────
   gemini-flash-api:
     backend: gemini_api
     model: gemini-2.0-flash      # 15 RPM free tier
@@ -135,6 +148,16 @@ backends:
     type: cli
     cli_binary: copilot
     cli_args: ["--model", "gpt-5.1-codex-mini", "-s", "--allow-all"]
+
+  # ── Copilot Web ────────────────────────────────────────────────────────────
+  # _U cookie is auto-extracted from Chrome by default.
+  # For reliability, paste it explicitly:
+  #   1. Open Chrome → copilot.microsoft.com → sign in
+  #   2. F12 → Application → Cookies → https://www.bing.com → copy _U value
+  copilot_web:
+    type: copilot_web
+    cookies:
+      _U: ""                    # leave empty for auto-extract, or paste value
 
   # ── Gemini Web ─────────────────────────────────────────────────────────────
   # Cookies are auto-extracted from Chrome by default.

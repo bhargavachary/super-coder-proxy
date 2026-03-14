@@ -26,6 +26,7 @@ from typing import AsyncIterator
 import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import BaseModel
 from starlette.responses import Response as StarletteResponse
 
 from .auth import AuthManager
@@ -907,7 +908,138 @@ async def _handle_copilot_web(
 
 # ── Context Bridge — Browser Backend ──────────────────────────────────────────
 
-_BROWSER_PROFILE_DIR = Path.home() / ".config" / "context-bridge" / "profile"
+import platform as _platform
+import shutil as _shutil
+import subprocess as _subprocess
+
+# Chrome Remote Debugging Protocol — how we attach to a real Chrome instance.
+# Using CDP means zero automation flags: no "controlled by test software" banner,
+# real sessions, and existing logins all work.
+_CDP_PORT = 9222
+
+# Dedicated Chrome profile for CDP automation.  Separate from the user's main
+# Chrome profile so both can run side-by-side.  Sessions persist here, so the
+# user only needs to sign in once per service.
+_CDP_PROFILE_DIR = Path.home() / ".config" / "context-bridge" / "chrome-cdp"
+
+
+def _find_chrome_exe() -> str | None:
+    """Locate the Chrome/Chromium binary on this OS."""
+    by_os: dict[str, list[str]] = {
+        "Darwin": [
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            "/Applications/Chromium.app/Contents/MacOS/Chromium",
+        ],
+        "Linux": [
+            "/usr/bin/google-chrome-stable",
+            "/usr/bin/google-chrome",
+            "/usr/bin/chromium-browser",
+            "/usr/bin/chromium",
+        ],
+        "Windows": [
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+        ],
+    }
+    for path in by_os.get(_platform.system(), []):
+        if Path(path).exists():
+            return path
+    for name in ("google-chrome-stable", "google-chrome", "chromium", "chromium-browser"):
+        if found := _shutil.which(name):
+            return found
+    return None
+
+
+async def _cdp_is_alive(port: int = _CDP_PORT) -> bool:
+    """Return True if a Chrome CDP endpoint is already listening on *port*."""
+    try:
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection("127.0.0.1", port), timeout=1.0
+        )
+        writer.close()
+        await writer.wait_closed()
+        return True
+    except Exception:
+        return False
+
+
+async def _wait_for_cdp(port: int = _CDP_PORT, timeout: float = 15.0) -> bool:
+    """Poll until Chrome's CDP endpoint is ready (up to *timeout* seconds)."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while loop.time() < deadline:
+        if await _cdp_is_alive(port):
+            return True
+        await asyncio.sleep(0.4)
+    return False
+
+
+async def _ensure_cdp_browser() -> None:
+    """Ensure a Chrome instance is running with CDP and store the connection.
+
+    Three tiers:
+      1. CDP port already open → attach directly.  This handles the power-user
+         case where Chrome was launched with --remote-debugging-port=9222 (e.g.
+         the user's main browser) — we get real sessions for free.
+      2. CDP port not open → launch a *dedicated* Chrome profile from
+         _CDP_PROFILE_DIR with --remote-debugging-port, then attach.
+         The dedicated profile coexists beside the user's main Chrome window
+         and its sessions persist across proxy restarts (one-time sign-in).
+      3. Chrome binary not found → raise a clear error.
+    """
+    global _pw_browser, _pw_context
+
+    # Re-use if still connected
+    if _pw_browser is not None:
+        try:
+            _ = _pw_browser.contexts   # raises if CDP connection dropped
+            return
+        except Exception:
+            logger.warning("CDP connection lost — reconnecting")
+            _pw_browser = None
+            _pw_context = None
+
+    first_run = not (_CDP_PROFILE_DIR / "Default").exists()
+
+    if await _cdp_is_alive():
+        logger.info("Attaching to existing Chrome CDP on port %d", _CDP_PORT)
+    else:
+        chrome = _find_chrome_exe()
+        if not chrome:
+            raise RuntimeError(
+                "Google Chrome not found. Install Chrome or start it manually with "
+                f"--remote-debugging-port={_CDP_PORT} and reload."
+            )
+
+        _CDP_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+        cmd = [
+            chrome,
+            f"--remote-debugging-port={_CDP_PORT}",
+            f"--user-data-dir={_CDP_PROFILE_DIR}",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-infobars",  # suppress the automation infobar
+        ]
+        logger.info("Launching Chrome CDP profile: %s", _CDP_PROFILE_DIR)
+        _subprocess.Popen(cmd, stdout=_subprocess.DEVNULL, stderr=_subprocess.DEVNULL)
+
+        if not await _wait_for_cdp(timeout=15):
+            raise RuntimeError(
+                f"Chrome did not open CDP on port {_CDP_PORT} within 15 s. "
+                "Check that nothing else is using that port."
+            )
+
+    _pw_browser = await _pw_instance.chromium.connect_over_cdp(
+        f"http://127.0.0.1:{_CDP_PORT}"
+    )
+    contexts = _pw_browser.contexts
+    _pw_context = contexts[0] if contexts else await _pw_browser.new_context()
+    logger.info(
+        "Connected to Chrome via CDP (%d existing context(s), first_run=%s)",
+        len(contexts), first_run,
+    )
+    # Stash first_run on the module so /browser/launch can report it
+    _pw_browser._vscode_first_run = first_run
 
 _CHAT_TARGETS: dict[str, str] = {
     "gemini":  "https://gemini.google.com",
@@ -948,59 +1080,144 @@ _EXTRACT_JS: dict[str, str] = {
     "claude":  "const m=document.querySelectorAll('[data-is-streaming=\"false\"] .font-claude-message,.assistant-message');return m.length?m[m.length-1].innerText:'';",
 }
 
+# CSS selectors tried in order to locate the chat input field
+_INPUT_SELECTORS: dict[str, list[str]] = {
+    "gemini":  [
+        "rich-textarea div[contenteditable='true']",
+        "div[contenteditable='true'][data-placeholder]",
+        "textarea[placeholder*='Enter a prompt']",
+        "div[contenteditable='true']",
+    ],
+    "copilot": [
+        "cib-text-input textarea",
+        "#userInput",
+        "textarea[placeholder*='Ask']",
+        "textarea",
+    ],
+    "chatgpt": [
+        "#prompt-textarea",
+        "div[contenteditable='true'][data-placeholder]",
+        "textarea[data-id='root']",
+    ],
+    "claude":  [
+        "div[contenteditable='true'][data-placeholder*='message']",
+        ".ProseMirror[contenteditable='true']",
+        "div[contenteditable='true']",
+    ],
+}
+
+# CSS selectors tried in order to locate the submit button
+_SUBMIT_SELECTORS: dict[str, list[str]] = {
+    "gemini":  [
+        "button[aria-label='Send message']",
+        "button.send-button",
+        "[data-mat-icon-name='send']",
+    ],
+    "copilot": [
+        "button[aria-label='Submit']",
+        "button[type='submit']",
+        "cib-text-input button",
+    ],
+    "chatgpt": [
+        "button[data-testid='send-button']",
+        "button[aria-label='Send prompt']",
+    ],
+    "claude":  [
+        "button[aria-label='Send Message']",
+        "button[data-testid='send-button']",
+    ],
+}
+
 _pw_instance = None
-_pw_context  = None   # BrowserContext (persistent)
+_pw_browser  = None   # CDP-connected Browser (real Chrome, no automation flags)
+_pw_context  = None   # Default BrowserContext from CDP connection
 _pw_pages: dict[str, object] = {}  # target -> Page
 _pw_lock = asyncio.Lock()
 
 
 async def _get_browser_page(target: str):
-    """Return (and lazily create) the Playwright page for a given target."""
-    global _pw_instance, _pw_context, _pw_pages
+    """Return (or lazily open) the Playwright page for *target*.
+
+    Uses Chrome Remote Debugging Protocol — no automation flags injected, no
+    'controlled by automated test software' banner, and all cookies/logins
+    stored in the CDP profile are available from the very first open.
+    """
+    global _pw_instance, _pw_pages
 
     async with _pw_lock:
+        # Re-validate existing page (user may have closed it from Chrome)
         if target in _pw_pages:
-            return _pw_pages[target]
+            try:
+                _ = _pw_pages[target].url
+                return _pw_pages[target]
+            except Exception:
+                del _pw_pages[target]
 
         from playwright.async_api import async_playwright
 
         if _pw_instance is None:
             _pw_instance = await async_playwright().start()
 
-        if _pw_context is None:
-            _BROWSER_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
-            _pw_context = await _pw_instance.chromium.launch_persistent_context(
-                str(_BROWSER_PROFILE_DIR),
-                headless=False,
-                channel="chromium",
-                viewport={"width": 1280, "height": 900},
-                args=["--disable-blink-features=AutomationControlled"],
-            )
+        await _ensure_cdp_browser()   # connect / launch Chrome via CDP
 
         page = await _pw_context.new_page()
         url = _CHAT_TARGETS.get(target, _CHAT_TARGETS["gemini"])
         await page.goto(url, wait_until="domcontentloaded")
 
+        tab_label = f"VS Code · {target}"
+        try:
+            await page.evaluate(f"document.title = {repr(tab_label)}")
+        except Exception:
+            pass
+
         css = _FOCUS_CSS.get(target, "")
         if css:
             await page.add_style_tag(content=css)
-            # Re-inject on every navigation (SPAs replace DOM)
             page.on("framenavigated", lambda f: asyncio.ensure_future(
                 page.add_style_tag(content=css) if f == page.main_frame else asyncio.sleep(0)
             ))
 
-        logger.info("Browser page launched: %s → %s", target, url)
+        async def _relabel(frame):
+            if frame == page.main_frame:
+                try:
+                    await page.evaluate(f"document.title = {repr(tab_label)}")
+                except Exception:
+                    pass
+        page.on("framenavigated", lambda f: asyncio.ensure_future(_relabel(f)))
+
+        logger.info("Browser page opened for '%s' → %s", target, url)
         _pw_pages[target] = page
         return page
 
 
+@app.get("/browser/status")
+async def browser_status(target: str = "gemini"):
+    """Return browser connection state so the panel can show live status."""
+    cdp_ready = await _cdp_is_alive()
+    first_run = cdp_ready and not (_CDP_PROFILE_DIR / "Default").exists()
+    return {
+        "cdp_ready": cdp_ready,
+        "browser_connected": _pw_browser is not None,
+        "page_open": target in _pw_pages,
+        "cdp_port": _CDP_PORT,
+        # True when the CDP profile has never been used → user needs to sign in
+        "first_run": not (_CDP_PROFILE_DIR / "Default").exists(),
+    }
+
+
 @app.post("/browser/launch")
 async def browser_launch(target: str = "gemini"):
-    """Open (or focus) a chat browser tab in focus mode for the given target."""
+    """Open (or focus) a chat browser tab for *target* via Chrome CDP."""
     try:
+        first_run_before = not (_CDP_PROFILE_DIR / "Default").exists()
         page = await _get_browser_page(target)
         await page.bring_to_front()
-        return {"ok": True, "url": page.url}
+        return {
+            "ok": True,
+            "url": page.url,
+            # Let the panel know if this is the first launch (needs sign-in)
+            "first_run": first_run_before,
+        }
     except Exception as e:
         logger.error("Browser launch error: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
@@ -1021,21 +1238,115 @@ async def browser_extract(target: str = "gemini"):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+class InjectRequest(BaseModel):
+    text: str
+    submit: bool = True
+
+
+@app.post("/browser/inject")
+async def browser_inject(target: str = "gemini", body: InjectRequest = None):
+    """Type text into the chat input of the active browser page and optionally submit.
+
+    The endpoint tries a series of CSS selectors for both the input field and
+    submit button.  Works with both <textarea> and contenteditable elements.
+    """
+    if target not in _pw_pages:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No browser page open for '{target}'. Call /browser/launch first.",
+        )
+    if body is None or not body.text:
+        raise HTTPException(status_code=422, detail="'text' field is required.")
+
+    page = _pw_pages[target]
+    text = body.text
+
+    # --- locate the input field ---
+    input_el = None
+    for sel in _INPUT_SELECTORS.get(target, ["textarea", "div[contenteditable='true']"]):
+        try:
+            loc = page.locator(sel).first
+            if await loc.count() > 0 and await loc.is_visible():
+                input_el = loc
+                break
+        except Exception:
+            continue
+
+    if input_el is None:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Could not find chat input for '{target}'. The page may not be ready.",
+        )
+
+    try:
+        await input_el.click()
+        # Clear existing content first (Ctrl+A → Delete)
+        await page.keyboard.press("Control+a")
+        await page.keyboard.press("Delete")
+        # Type the text — use keyboard.type for contenteditable richtext support
+        await page.keyboard.type(text, delay=5)
+        logger.info("Injected %d chars into '%s' input", len(text), target)
+    except Exception as e:
+        logger.error("Browser inject (type) error: %s", e)
+        raise HTTPException(status_code=500, detail=f"Typing failed: {e}")
+
+    if not body.submit:
+        return {"ok": True, "submitted": False}
+
+    # --- locate and click the submit button ---
+    submit_el = None
+    for sel in _SUBMIT_SELECTORS.get(target, ["button[type='submit']"]):
+        try:
+            loc = page.locator(sel).first
+            if await loc.count() > 0 and await loc.is_visible():
+                submit_el = loc
+                break
+        except Exception:
+            continue
+
+    if submit_el:
+        try:
+            await submit_el.click()
+            logger.info("Clicked submit button for '%s'", target)
+            return {"ok": True, "submitted": True}
+        except Exception as e:
+            logger.warning("Submit click failed for '%s': %s — trying Enter", target, e)
+
+    # Fallback: press Enter
+    try:
+        await page.keyboard.press("Enter")
+        logger.info("Submitted via Enter for '%s'", target)
+        return {"ok": True, "submitted": True, "method": "enter"}
+    except Exception as e:
+        logger.error("Browser inject (submit) error: %s", e)
+        raise HTTPException(status_code=500, detail=f"Submit failed: {e}")
+
+
 @app.post("/browser/close")
 async def browser_close(target: str | None = None):
-    """Close one browser page (or all if target is omitted)."""
-    global _pw_context, _pw_pages
+    """Close one browser page (or all if target is omitted).
+
+    Does NOT kill the Chrome process — it keeps running so the user can still
+    browse normally.  Just disconnects Playwright's handle.
+    """
+    global _pw_browser, _pw_context, _pw_pages
     if target:
         page = _pw_pages.pop(target, None)
         if page:
-            await page.close()
+            try:
+                await page.close()
+            except Exception:
+                pass
     else:
         for page in list(_pw_pages.values()):
-            await page.close()
+            try:
+                await page.close()
+            except Exception:
+                pass
         _pw_pages.clear()
-        if _pw_context:
-            await _pw_context.close()
-            _pw_context = None
+        # Disconnect from CDP — Chrome keeps running normally
+        _pw_browser = None
+        _pw_context = None
     return {"ok": True}
 
 
